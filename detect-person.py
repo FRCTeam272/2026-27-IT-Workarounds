@@ -2,7 +2,10 @@
 """Detect persons in a webcam feed or image/video file using OpenCV DNN + YOLOv5n (ONNX)."""
 
 import argparse
+import ctypes
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -18,6 +21,98 @@ INPUT_SIZE = (640, 640)
 PERSON_CLASS = 0   # COCO class 0 = person
 DEFAULT_CONF = 0.4
 DEFAULT_NMS = 0.45
+DEFAULT_SOUND = Path(__file__).parent / "sound.mp3"
+DEFAULT_COOLDOWN = 10.0
+DEFAULT_WAIT_TIME = 5.0
+
+
+def toggle_media_playback():
+    """Toggle system media play/pause state (Windows VK_MEDIA_PLAY_PAUSE)."""
+    if sys.platform == "win32":
+        try:
+            VK_MEDIA_PLAY_PAUSE = 0xB3
+            KEYEVENTF_KEYUP = 0x0002
+            ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_KEYUP, 0)
+        except Exception as exc:
+            print(f"\n[Alert] Error toggling media: {exc}")
+
+
+def play_sound(sound_path: Path):
+    """Play a sound file (MP3/WAV) using Windows MCI or system fallback."""
+    path_obj = Path(sound_path).resolve()
+    if not path_obj.exists():
+        print(f"\n[Alert] Warning: Sound file not found: '{path_obj}'")
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+        return
+
+    if sys.platform == "win32":
+        try:
+            mci = ctypes.windll.winmm.mciSendStringW
+            buf = ctypes.create_unicode_buffer(500)
+            res = ctypes.windll.kernel32.GetShortPathNameW(str(path_obj), buf, 500)
+            target = buf.value if res > 0 else str(path_obj)
+            alias = "door_detector_alert"
+            mci(f"close {alias}", None, 0, 0)
+            err = mci(f'open "{target}" type mpegvideo alias {alias}', None, 0, 0)
+            if err != 0:
+                err = mci(f'open "{target}" alias {alias}', None, 0, 0)
+            if err == 0:
+                mci(f"play {alias} wait", None, 0, 0)
+                mci(f"close {alias}", None, 0, 0)
+                return
+        except Exception as exc:
+            print(f"\n[Alert] Error playing sound via MCI: {exc}")
+
+    if sys.platform == "win32":
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+
+
+class AlertController:
+    """Manages cooldown and executes the media pause -> sound -> wait -> resume alert flow."""
+
+    def __init__(self, sound_path: Path, cooldown: float = DEFAULT_COOLDOWN, wait_time: float = DEFAULT_WAIT_TIME):
+        self.sound_path = Path(sound_path)
+        self.cooldown = cooldown
+        self.wait_time = wait_time
+        self.last_triggered_time = 0.0
+        self.is_running = False
+        self._lock = threading.Lock()
+
+    def trigger(self):
+        with self._lock:
+            now = time.time()
+            if self.is_running or (now - self.last_triggered_time) < self.cooldown:
+                return False
+            self.is_running = True
+
+        thread = threading.Thread(target=self._run_alert_sequence, daemon=True)
+        thread.start()
+        return True
+
+    def _run_alert_sequence(self):
+        try:
+            print("\n[Alert] Person detected! Pausing media playback...")
+            toggle_media_playback()
+            print(f"[Alert] Playing sound '{self.sound_path.name}'...")
+            play_sound(self.sound_path)
+            print(f"[Alert] Waiting {self.wait_time:.1f} seconds...")
+            time.sleep(self.wait_time)
+            print("[Alert] Resuming media playback...")
+            toggle_media_playback()
+        finally:
+            with self._lock:
+                self.last_triggered_time = time.time()
+                self.is_running = False
 
 
 def _progress(blocks, block_size, total):
@@ -77,7 +172,7 @@ def annotate(frame, boxes, scores):
     cv2.putText(frame, f"Persons: {len(boxes)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
 
-def run_webcam(net, conf, nms):
+def run_webcam(net, conf, nms, alert_controller):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         sys.exit("Error: could not open webcam.")
@@ -87,6 +182,8 @@ def run_webcam(net, conf, nms):
         if not ret:
             break
         boxes, scores = detect(net, frame, conf, nms)
+        if boxes:
+            alert_controller.trigger()
         print(f"\rPerson in frame: {bool(boxes)} ({len(boxes)} detected)", end="", flush=True)
         annotate(frame, boxes, scores)
         cv2.imshow("Person Detector", frame)
@@ -97,11 +194,13 @@ def run_webcam(net, conf, nms):
     cv2.destroyAllWindows()
 
 
-def run_image(net, path, conf, nms):
+def run_image(net, path, conf, nms, alert_controller):
     frame = cv2.imread(path)
     if frame is None:
         sys.exit(f"Error: could not read '{path}'.")
     boxes, scores = detect(net, frame, conf, nms)
+    if boxes:
+        alert_controller.trigger()
     print(f"Person in frame: {bool(boxes)} ({len(boxes)} detected)")
     annotate(frame, boxes, scores)
     cv2.imshow("Person Detector", frame)
@@ -109,7 +208,7 @@ def run_image(net, path, conf, nms):
     cv2.destroyAllWindows()
 
 
-def run_video(net, path, conf, nms):
+def run_video(net, path, conf, nms, alert_controller):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         sys.exit(f"Error: could not open '{path}'.")
@@ -121,6 +220,8 @@ def run_video(net, path, conf, nms):
             break
         frame_num += 1
         boxes, scores = detect(net, frame, conf, nms)
+        if boxes:
+            alert_controller.trigger()
         print(f"\rFrame {frame_num} — Person: {bool(boxes)} ({len(boxes)})", end="", flush=True)
         annotate(frame, boxes, scores)
         cv2.imshow("Person Detector", frame)
@@ -139,16 +240,23 @@ def main():
                         help=f"Confidence threshold (default: {DEFAULT_CONF}).")
     parser.add_argument("--nms", type=float, default=DEFAULT_NMS,
                         help=f"NMS IoU threshold (default: {DEFAULT_NMS}).")
+    parser.add_argument("--sound", type=Path, default=DEFAULT_SOUND,
+                        help=f"Path to alert sound MP3 file (default: {DEFAULT_SOUND.name}).")
+    parser.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN,
+                        help=f"Cooldown in seconds after alert finishes (default: {DEFAULT_COOLDOWN}s).")
+    parser.add_argument("--wait-time", type=float, default=DEFAULT_WAIT_TIME,
+                        help=f"Seconds to wait after sound before resuming media (default: {DEFAULT_WAIT_TIME}s).")
     args = parser.parse_args()
 
     net = load_net()
+    alert_controller = AlertController(sound_path=args.sound, cooldown=args.cooldown, wait_time=args.wait_time)
 
     if args.source == "webcam":
-        run_webcam(net, args.confidence, args.nms)
+        run_webcam(net, args.confidence, args.nms, alert_controller)
     elif args.source.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
-        run_image(net, args.source, args.confidence, args.nms)
+        run_image(net, args.source, args.confidence, args.nms, alert_controller)
     else:
-        run_video(net, args.source, args.confidence, args.nms)
+        run_video(net, args.source, args.confidence, args.nms, alert_controller)
 
 
 if __name__ == "__main__":
